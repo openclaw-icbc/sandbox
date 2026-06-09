@@ -1,0 +1,13 @@
+{
+  "allowList": [
+    "\\bplaywright(-cli|-mcp)?\\b",
+    "\\b(wps)\\b",
+    "\\b(xdg-email)\\b",
+    "\\b(xdg-open)\\b"
+  ],
+  "denyList": [
+    "\\brm\\b",
+    "\\btrash\\b"
+  ],
+  "defaultAction": "deny"
+}

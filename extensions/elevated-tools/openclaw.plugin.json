@@ -1,0 +1,16 @@
+﻿{
+  "id": "elevated-tools",
+  "name": "elevated-tools",
+  "description": "exec tools 提权决策工具",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "hooks": ["before_tool_call"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

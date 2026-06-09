@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+
+# ================= LAYERS 1: 编译/下载阶段 =================
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=cache,id=openclaw-sandbox-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-sandbox-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    echo "deb http://mirrors.ustc.edu.cn/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3-pip python3-venv
+
+# 创建虚拟环境
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 安装Python依赖（已禁用pip缓存）
+RUN pip3 install --no-cache-dir pandas openpyxl requests
+
+# 深度清理Python虚拟环境
+RUN pip uninstall -y pip setuptools wheel && \
+    find /opt/venv -type f -name "*.pyc" -delete && \
+    find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + && \
+    find /opt/venv -type d \( -name "tests" -o -name "test" -o -name "docs" -o -name "doc" -o -name "examples" \) -exec rm -rf {} + && \
+    find /opt/venv -type d \( -name "*.egg-info" -o -name "*.dist-info" \) -exec rm -rf {} +
+
+
+# ================= LAYERS 2: 最终运行阶段 =================
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# 合并RUN层+系统级无用文件清理
+RUN --mount=type=cache,id=openclaw-sandbox-bookworm-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=openclaw-sandbox-bookworm-apt-lists,target=/var/lib/apt,sharing=locked \
+    echo "deb http://mirrors.ustc.edu.cn/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/debian bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.ustc.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        python3 \
+        ripgrep && \
+    # 删除系统文档、手册、本地化文件
+    rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/locale/* /usr/share/info/* && \
+    # 创建非root用户（合并到同一层避免额外体积）
+    useradd --create-home --shell /bin/bash sandbox
+
+# 使用--link加速层缓存
+COPY --link --from=builder /opt/venv /opt/venv
+
+USER sandbox
+WORKDIR /home/sandbox
+
+CMD ["sleep", "infinity"]
