@@ -46,6 +46,10 @@
 #define SERVICE_HOST "127.0.0.1"
 #define SERVICE_PORT 18901
 
+#ifndef SKIP_CALLER_AUTH
+#define SKIP_CALLER_AUTH 0
+#endif
+
 typedef struct {
     pid_t pid;
 } TrustedProcess;
@@ -149,8 +153,35 @@ static int safe_open_cache(void)
     return fd;
 }
 
-static int read_cache(pid_t ppid)
+/* 读取 /proc/<pid>/stat 的 ppid（第 4 字段）。
+ * comm 字段在括号内且可能含空格/括号，用最后一个 ')' 定位以避免错位。*/
+static pid_t parent_pid(pid_t pid)
 {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+
+    char state;
+    pid_t ppid = -1;
+    if (sscanf(p, ") %c %d", &state, &ppid) == 2)
+        return ppid;
+    return -1;
+}
+
+/* 把缓存中的全部 trusted pid 装入 list（不再只匹配单个 pid）*/
+static int load_cache_list(TrustedProcess *list, int max, int *count_out)
+{
+    *count_out = 0;
     int fd = safe_open_cache();
     if (fd < 0) return 0;
 
@@ -163,14 +194,15 @@ static int read_cache(pid_t ppid)
 
     char *saveptr = NULL;
     char *token = strtok_r(line, ",", &saveptr);
-    while (token) {
+    while (token && *count_out < max) {
         pid_t pid = 0;
-        if (sscanf(token, "%d", &pid) == 1) {
-            if (pid == ppid) return 1;
+        if (sscanf(token, "%d", &pid) == 1 && pid > 0) {
+            list[*count_out].pid = pid;
+            (*count_out)++;
         }
         token = strtok_r(NULL, ",", &saveptr);
     }
-    return 0;
+    return *count_out > 0;
 }
 
 static void update_cache(TrustedProcess *list, int count)
@@ -256,19 +288,84 @@ static int fetch_remote(TrustedProcess *list, int *count_out)
     return idx > 0;
 }
 
-static int check_caller_auth(void)
+/* 从 start 起沿 /proc/<pid>/stat 的 ppid 链向上遍历，
+ * 命中 trusted 列表中的任意 pid 即认为调用源为 openclaw。
+ * 解决 openclaw 经 bash/subprocess 间接拉起 docker 时
+ * getppid() 命中不到 openclaw 网关 pid 的问题。*/
+static int walk_chain(pid_t start, TrustedProcess *list, int count)
+{
+    pid_t cur = start;
+    for (int depth = 0; depth < 64 && cur > 1; depth++) {
+        for (int i = 0; i < count; i++) {
+            if (list[i].pid == cur) return 1;
+        }
+        pid_t next = parent_pid(cur);
+        if (next <= 0 || next == cur) break;
+        cur = next;
+    }
+    return 0;
+}
+
+/* 将从 start 起的祖先链格式化为 "p1<-p2<-..." */
+static void format_chain(pid_t start, char *out, size_t out_size)
+{
+    size_t off = 0;
+    pid_t cur = start;
+    out[0] = '\0';
+    for (int depth = 0; depth < 64 && cur > 1; depth++) {
+        int w = snprintf(out + off, out_size - off, "%s%d", (depth ? "<-" : ""), (int)cur);
+        if (w < 0 || (size_t)w >= out_size - off) break;
+        off += (size_t)w;
+        pid_t next = parent_pid(cur);
+        if (next <= 0 || next == cur) break;
+        cur = next;
+    }
+}
+
+/* 将 trusted 列表格式化为 "p1,p2,..." */
+static void format_list(TrustedProcess *list, int count, char *out, size_t out_size)
+{
+    size_t off = 0;
+    out[0] = '\0';
+    for (int i = 0; i < count; i++) {
+        int w = snprintf(out + off, out_size - off, "%s%d", (i ? "," : ""), (int)list[i].pid);
+        if (w < 0 || (size_t)w >= out_size - off) break;
+        off += (size_t)w;
+    }
+}
+
+/* reason/reason_size: 校验不通过时填入诊断信息（祖先链 + 注册 pid 列表）*/
+static int check_caller_auth(char *reason, size_t reason_size)
 {
     pid_t ppid = getppid();
-    if (read_cache(ppid)) return 1;
 
-    TrustedProcess list[MAX_PIDS_COUNT];
-    int count = 0;
-    if (!fetch_remote(list, &count)) return 0;
+    TrustedProcess cache_list[MAX_PIDS_COUNT];
+    int cache_count = 0;
+    int have_cache = load_cache_list(cache_list, MAX_PIDS_COUNT, &cache_count);
+    if (have_cache && walk_chain(ppid, cache_list, cache_count)) return 1;
 
-    update_cache(list, count);
-    for (int i = 0; i < count; i++) {
-        if (list[i].pid == ppid) return 1;
+    TrustedProcess remote_list[MAX_PIDS_COUNT];
+    int remote_count = 0;
+    int remote_ok = fetch_remote(remote_list, &remote_count);
+    if (remote_ok) {
+        update_cache(remote_list, remote_count);
+        if (walk_chain(ppid, remote_list, remote_count)) return 1;
     }
+
+    /* 校验不通过：输出祖先链与注册 pid 列表，便于定位 */
+    char chain[640];
+    char pids[2048];
+    format_chain(ppid, chain, sizeof(chain));
+    if (remote_ok) {
+        format_list(remote_list, remote_count, pids, sizeof(pids));
+    } else if (have_cache) {
+        format_list(cache_list, cache_count, pids, sizeof(pids));
+    } else {
+        snprintf(pids, sizeof(pids), "无(缓存与远程均不可达)");
+    }
+    snprintf(reason, reason_size,
+             "未通过 OpenClaw Runtime 认证; 祖先链=[%s]; 注册pids=[%s]%s",
+             chain, pids, remote_ok ? "" : "; 远程heartbeat不可达");
     return 0;
 }
 
@@ -367,11 +464,13 @@ int main(int argc, char *argv[])
     if (argc < 1) return 1;
     const char *deny_msg = NULL;
 
-    if (!check_caller_auth()) {
-        deny_msg = "未通过 OpenClaw Runtime 认证";
-        audit_log(1, deny_msg, argc, argv);
-        fprintf(stderr, "安全限制: %s\n", deny_msg);
-        return 1;
+    if (!SKIP_CALLER_AUTH) {
+        char auth_reason[4096];
+        if (!check_caller_auth(auth_reason, sizeof(auth_reason))) {
+            audit_log(1, auth_reason, argc, argv);
+            fprintf(stderr, "安全限制: 未通过 OpenClaw Runtime 认证\n");
+            return 1;
+        }
     }
 
     if (!check_security(argc, argv, &deny_msg)) {
